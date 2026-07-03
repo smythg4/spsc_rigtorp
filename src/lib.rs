@@ -130,7 +130,7 @@ impl<T> RingBuffer<T> {
         (Producer { buffer: p_buffer }, Consumer { buffer: c_buffer })
     }
 
-    // Rigtorp's `push` implementation in C++
+    // Rigtorp's `push` implementation in C++ (without caching optimization)
     // bool push(int val) {
     //     auto const writeIdx = writeIdx_.load(std::memory_order_relaxed);
     //     auto nextWriteIdx = writeIdx + 1;
@@ -201,7 +201,7 @@ impl<T> RingBuffer<T> {
         None
     }
 
-    // Rigtorp's `pop` implementation in C++
+    // Rigtorp's `pop` implementation in C++ (without caching optimization)
     // bool pop(int &val) {
     //     auto const readIdx = readIdx_.load(std::memory_order_relaxed);
     //     if (readIdx == writeIdx_.load(std::memory_order_acquire)) {
