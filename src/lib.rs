@@ -1,8 +1,8 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 // Rigtorp's C++ definition of `ringbuffer`
 // struct ringbuffer {
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// # Panics will `panic!` if `capacity` == 1 due to required dummy slot to distinguish
 /// empty from full (see README)
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
-    RingBuffer::new(capacity)
+    RingBuffer::new_channels(capacity)
 }
 
 /// A wrapper around a `Arc<RingBuffer<T>>`, call `.send(val)` to push a value on to
@@ -37,6 +37,12 @@ impl<T> Producer<T> {
     /// For benchmarking purposes only
     pub fn send_no_cache(&self, value: T) -> Option<T> {
         self.buffer.push_back_no_cache(value)
+    }
+
+    /// Public API for accessing `RingBuffer`s internal `push_back_blocking()`
+    /// This version will block if the queue is full when you try to send
+    pub fn send_blocking(&self, value: T) {
+        self.buffer.push_back_blocking(value)
     }
 
     /// Convenience method to check if the queue is full before calling `.send(val)`
@@ -64,6 +70,12 @@ impl<T> Consumer<T> {
         self.buffer.pop_front_no_cache()
     }
 
+    /// Public API for accessing `RingBuffer`s internal `pop_front_blocking()`
+    /// This version will block if the queue is empty when you try to recv
+    pub fn recv_blocking(&self) -> T {
+        self.buffer.pop_front_blocking()
+    }
+
     /// Convenience method to check if the queue is empty before calling `.recv()`
     /// Has side-effect of updating the internal cached index values
     pub fn is_empty(&self) -> bool {
@@ -71,13 +83,17 @@ impl<T> Consumer<T> {
     }
 }
 
- struct RingBuffer<T> {
+struct RingBuffer<T> {
     data: Vec<UnsafeCell<MaybeUninit<T>>>, // `MaybeUninit<T>` is similar to `Option<T>` without safety checks or overhead
-     read_idx: CacheAligned<AtomicUsize>,
+    read_idx: CacheAligned<AtomicUsize>,
     read_idx_cached: CacheAligned<UnsafeCell<usize>>,
-     write_idx: CacheAligned<AtomicUsize>,
+    write_idx: CacheAligned<AtomicUsize>,
     write_idx_cached: CacheAligned<UnsafeCell<usize>>,
     capacity: usize, // avoids repeated calls to `data.len()` during push and pop operations
+
+    // used for blocking implementation
+    mtx: Mutex<()>,
+    cv: Condvar,
 }
 
 unsafe impl<T: Send> Send for RingBuffer<T> {}
@@ -110,7 +126,7 @@ impl<T> From<T> for CacheAligned<T> {
 impl<T> RingBuffer<T> {
     /// One slot must be reserved for determining if the queue is full
     /// a capacity of 1 will lead to a persistently full and useless queue
-    pub fn new(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    pub fn new_channels(capacity: usize) -> (Producer<T>, Consumer<T>) {
         assert!(
             capacity > 1,
             "Capacity of 1 will result in a full and useless RingBuffer"
@@ -125,6 +141,8 @@ impl<T> RingBuffer<T> {
             write_idx: AtomicUsize::new(0).into(),
             write_idx_cached: UnsafeCell::new(0).into(),
             capacity,
+            mtx: Mutex::new(()),
+            cv: Condvar::new(),
         });
         let c_buffer = Arc::clone(&p_buffer);
         (Producer { buffer: p_buffer }, Consumer { buffer: c_buffer })
@@ -201,6 +219,37 @@ impl<T> RingBuffer<T> {
         None
     }
 
+    /// push_back_blocking accepts a `T` value and writes it to the writer end of the queue
+    /// Returns nothing but blocks the thread until a `pop` is called if the queue is full
+    fn push_back_blocking(&self, value: T) {
+        let write_idx = self.write_idx.load(Ordering::Relaxed);
+
+        // if we've hit the end of the ring buffer we will wrap back around to the beginning
+        let next_write_idx = (write_idx + 1) % self.capacity;
+
+        // SAFETY: We know that `read_idx_cached` holds quality data as it's
+        // initialized on `RingBuffer` creation and is updated with atomic load operations.
+        // Use of `UnsafeCell` is primarily to allow interior mutability with a `&self` method.
+        if next_write_idx == unsafe { *self.read_idx_cached.get() } {
+            // SAFETY: see above
+            unsafe { *self.read_idx_cached.get() = self.read_idx.load(Ordering::Acquire) };
+            // SAFETY: see above
+            if next_write_idx == unsafe { *self.read_idx_cached.get() } {
+                // this means the buffer is full we will put the thread to sleep
+                let guard = self.mtx.lock().unwrap();
+                let _guard = self.cv.wait(guard).unwrap();
+                return self.push_back_blocking(value);
+            }
+        }
+        // `.get()` to return the `*mut MaybeUninit`, then dereference that and call `.write(value)`
+        // SAFETY: We know that we have memory allocated in every vector slot, it may be uninitialized
+        // at this point, but we're writing good data into it
+        unsafe { (*self.data[write_idx].get()).write(value) };
+        // increment the `write_idx`
+        self.write_idx.store(next_write_idx, Ordering::Release);
+        self.cv.notify_one();
+    }
+
     // Rigtorp's `pop` implementation in C++ (without caching optimization)
     // bool pop(int &val) {
     //     auto const readIdx = readIdx_.load(std::memory_order_relaxed);
@@ -264,6 +313,37 @@ impl<T> RingBuffer<T> {
         Some(val)
     }
 
+    /// pop_front_blocking returns the first value on the queue.
+    /// It will block the thread if the queue is empty until woken up by a called to `push`
+    pub fn pop_front_blocking(&self) -> T {
+        let read_idx = self.read_idx.load(Ordering::Relaxed);
+        // SAFETY: We know that `write_idx_cached` holds quality data as it's
+        // initialized on `RingBuffer` creation and is updated with atomic load operations.
+        // Use of `UnsafeCell` is primarily to allow interior mutability with a `&self` method.
+        if read_idx == unsafe { *self.write_idx_cached.get() } {
+            // SAFETY: see above
+            unsafe { *self.write_idx_cached.get() = self.write_idx.load(Ordering::Acquire) };
+            // SAFETY: see above
+            if read_idx == unsafe { *self.write_idx_cached.get() } {
+                // this indicates that the queue is empty (see note about full in the `push_back`)
+                // implementation
+                let guard = self.mtx.lock().unwrap();
+                let _guard = self.cv.wait(guard).unwrap();
+                return self.pop_front_blocking();
+            }
+        }
+        // SAFETY: We know that a value is there (the queue isn't empty), which means something
+        // was written to the memory address
+        let val = unsafe { (*(self.data[read_idx].get())).assume_init_read() };
+
+        // calculate the next read index and wrap around if it hits the end of the list.
+        let next_read_idx = (read_idx + 1) % self.capacity;
+        // increment the read index
+        self.read_idx.store(next_read_idx, Ordering::Release);
+        self.cv.notify_one();
+        val
+    }
+
     /// should only be called by the consumer thread to preserve exclusive access to `read_idx`
     /// this will be accessed by `Consumer<T>.is_empty()` and `Self::pop_front()`
     fn is_empty(&self) -> bool {
@@ -322,7 +402,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_basic_operations() {
+    fn test_basic_operations_normal() {
         let num_writes = 2500;
         let (tx, rx) = channel(4);
 
@@ -388,6 +468,38 @@ mod tests {
                     println!("Popped: '{n}'");
                     received += 1;
                 }
+            }
+            received
+        });
+
+        let write_count = wjh.join().unwrap();
+        let read_count = rjh.join().unwrap();
+        assert_eq!(write_count, read_count);
+    }
+
+    #[test]
+    fn test_basic_operations_blocking() {
+        let num_writes = 2500;
+        let (tx, rx) = channel(4);
+
+        let wjh = thread::spawn(move || {
+            println!("Write thread spawned!");
+            let mut i = 0;
+            while i < num_writes {
+                tx.send_blocking(format!("[{i}] String Item"));
+                println!("Sent {i}");
+                i += 1;
+            }
+            i
+        });
+
+        let rjh = thread::spawn(move || {
+            println!("Read thread spawned!");
+            let mut received = 0;
+            while received < num_writes {
+                let n = rx.recv_blocking();
+                println!("Received: '{n}'");
+                received += 1;
             }
             received
         });
