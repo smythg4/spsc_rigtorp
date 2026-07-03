@@ -56,7 +56,16 @@ let val = rx.recv();
 ```
 
 ## Performance
-This is something I need to dig into. It will be a good exercise in using criterion and flamegraph.
+This still needs deeper exploration with criterion and flamegraph, but preliminary benchmarks reveal the following about throughput. I'm using a 2020 Apple M1 with 8 cores (4 Performance and 4 Efficiency).
+
+* Without Caching Optimization: 19,504,436 ops / second
+* With Caching Optimization:    20,068,849 ops / second
+
+Rigtorp reports benchmarks for his C++ implementation on his AMD Ryzen 9 3900X 12-Core Processor placing the two threads on different chiplets / core complexes (CCX) to be:
+* Without Caching Optimization: 5,513,850 ops / second
+* With Caching Optimization:    112,287,037 ops / second
+
+The Rust version dramatically out performs (~4x faster) when we look at the version without caching optimization throughput, but falls far short (~5.5x slower) compared to C++ with the optimization implemented. Perhaps it's an ARM/x86 difference? Perhaps the (minimal) overhead that comes with `UnsafeCell` for my cached items? There's always more to learn!
 
 ## Safety
 `RingBuffer<T>` implements `Send` and `Sync` both assuming that `T` is `Send`. The compiler can't auto derive these marker traits because `UnsafeCell` is inherently `!Sync`. This is ok because we're limited to two threads (a `Producer<T>` and a `Consumer<T>`). `Producer<T>` has exclusive access to `write_idx` and `Consumer<T>` has exclusive access to `read_idx`. Synchronization is required in the cases of an empty or full queue, which is discussed in the Memory Ordering section of this README.

@@ -2,3 +2,7 @@
 name = "spsc_rigtorp"
 version = "0.1.0"
 edition = "2024"
+
+  [[bench]]
+  name = "ring_buffer"
+  harness = false

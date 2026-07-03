@@ -33,6 +33,12 @@ impl<T> Producer<T> {
         self.buffer.push_back(value)
     }
 
+    /// Public API for accessing `RingBuffer`s internal `push_back_no_cache()`
+    /// For benchmarking purposes only
+    pub fn send_no_cache(&self, value: T) -> Option<T> {
+        self.buffer.push_back_no_cache(value)
+    }
+
     /// Convenience method to check if the queue is full before calling `.send(val)`
     /// Has side-effect of updating the internal cached index values
     pub fn is_full(&self) -> bool {
@@ -52,6 +58,12 @@ impl<T> Consumer<T> {
         self.buffer.pop_front()
     }
 
+    /// Public API for accessing `RingBuffer`s internal `pop_front_no_cache()`
+    /// For benchmarking purposes only
+    pub fn recv_no_cache(&self) -> Option<T> {
+        self.buffer.pop_front_no_cache()
+    }
+
     /// Convenience method to check if the queue is empty before calling `.recv()`
     /// Has side-effect of updating the internal cached index values
     pub fn is_empty(&self) -> bool {
@@ -59,11 +71,11 @@ impl<T> Consumer<T> {
     }
 }
 
-struct RingBuffer<T> {
+ struct RingBuffer<T> {
     data: Vec<UnsafeCell<MaybeUninit<T>>>, // `MaybeUninit<T>` is similar to `Option<T>` without safety checks or overhead
-    read_idx: CacheAligned<AtomicUsize>,
+     read_idx: CacheAligned<AtomicUsize>,
     read_idx_cached: CacheAligned<UnsafeCell<usize>>,
-    write_idx: CacheAligned<AtomicUsize>,
+     write_idx: CacheAligned<AtomicUsize>,
     write_idx_cached: CacheAligned<UnsafeCell<usize>>,
     capacity: usize, // avoids repeated calls to `data.len()` during push and pop operations
 }
@@ -73,7 +85,8 @@ unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 /// Used to guarantee cache alignment to reduce cache coherency traffic
 #[repr(align(64))]
-struct CacheAligned<T>(T);
+#[derive(PartialEq, Eq)]
+pub struct CacheAligned<T>(T);
 
 impl<T> Deref for CacheAligned<T> {
     type Target = T;
@@ -164,6 +177,30 @@ impl<T> RingBuffer<T> {
         None
     }
 
+    /// same as push_back but doesn't leverage the internal read_idx_cached
+    /// used for benchmarking only
+    fn push_back_no_cache(&self, value: T) -> Option<T> {
+        let write_idx = self.write_idx.load(Ordering::Relaxed);
+
+        // if we've hit the end of the ring buffer we will wrap back around to the beginning
+        let next_write_idx = (write_idx + 1) % self.capacity;
+
+        if next_write_idx == self.read_idx.load(Ordering::Acquire) {
+            // this means the buffer is full and we'll return the value back to the caller
+            // notice that we're comparing `next_write_idx` and not `write_idx`, this is what
+            // determines empty vs full. We will have one "dummy" slot in use to indicate full.
+            return Some(value);
+        }
+
+        // `.get()` to return the `*mut MaybeUninit`, then dereference that and call `.write(value)`
+        // SAFETY: We know that we have memory allocated in every vector slot, it may be uninitialized
+        // at this point, but we're writing good data into it
+        unsafe { (*self.data[write_idx].get()).write(value) };
+        // increment the `write_idx`
+        self.write_idx.store(next_write_idx, Ordering::Release);
+        None
+    }
+
     // Rigtorp's `pop` implementation in C++
     // bool pop(int &val) {
     //     auto const readIdx = readIdx_.load(std::memory_order_relaxed);
@@ -195,6 +232,26 @@ impl<T> RingBuffer<T> {
                 // implementation
                 return None;
             }
+        }
+        // SAFETY: We know that a value is there (the queue isn't empty), which means something
+        // was written to the memory address
+        let val = unsafe { (*(self.data[read_idx].get())).assume_init_read() };
+
+        // calculate the next read index and wrap around if it hits the end of the list.
+        let next_read_idx = (read_idx + 1) % self.capacity;
+        // increment the read index
+        self.read_idx.store(next_read_idx, Ordering::Release);
+        Some(val)
+    }
+
+    /// same as pop_front but doesn't leverage the internal write_idx_cached
+    /// used for benchmarking only
+    pub fn pop_front_no_cache(&self) -> Option<T> {
+        let read_idx = self.read_idx.load(Ordering::Relaxed);
+        if read_idx == self.write_idx.load(Ordering::Acquire) {
+            // this indicates that the queue is empty (see note about full in the `push_back`)
+            // implementation
+            return None;
         }
         // SAFETY: We know that a value is there (the queue isn't empty), which means something
         // was written to the memory address
@@ -290,6 +347,44 @@ mod tests {
             let mut received = 0;
             while received < num_writes {
                 if let Some(n) = rx.recv() {
+                    println!("Popped: '{n}'");
+                    received += 1;
+                }
+            }
+            received
+        });
+
+        let write_count = wjh.join().unwrap();
+        let read_count = rjh.join().unwrap();
+        assert_eq!(write_count, read_count);
+    }
+
+    #[test]
+    fn test_basic_operations_no_cache() {
+        let num_writes = 2500;
+        let (tx, rx) = channel(4);
+
+        let wjh = thread::spawn(move || {
+            let mut i = 0;
+            while i < num_writes {
+                match tx.send_no_cache(format!("[{i}] String Item")) {
+                    Some(n) => {
+                        println!("Failed to push '{n}', trying again...");
+                        thread::yield_now();
+                        continue;
+                    }
+                    None => {
+                        i += 1;
+                    }
+                }
+            }
+            i
+        });
+
+        let rjh = thread::spawn(move || {
+            let mut received = 0;
+            while received < num_writes {
+                if let Some(n) = rx.recv_no_cache() {
                     println!("Popped: '{n}'");
                     received += 1;
                 }
