@@ -104,8 +104,75 @@ fn bench_blocking() {
     );
 }
 
+fn bench_mpsc_blocking() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(RING_BUFFER_CAPACITY);
+
+    let read_jh = thread::spawn(move || {
+        let mut reads = 0;
+        while reads < NUM_ITEMS {
+            let _ = rx.recv();
+            reads += 1;
+        }
+        reads
+    });
+    let start = std::time::Instant::now();
+
+    let mut writes = 0;
+    while writes < NUM_ITEMS {
+        let _ = tx.send(writes);
+        writes += 1;
+    }
+
+    let r = read_jh.join().expect("Failed to join read join handle");
+    let run_time = start.elapsed();
+    let w = writes;
+    assert_eq!(r, w, "Reads didn't equal writes!");
+
+    let ops_rate = NUM_ITEMS as u128 * 1_000_000_000 / run_time.as_nanos();
+    println!(
+        "MPSC Sync Channel:\t{} ops / second (total time = {:?})",
+        ops_rate, run_time
+    );
+}
+
+fn bench_mpsc_nonblocking() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(RING_BUFFER_CAPACITY);
+
+    let read_jh = thread::spawn(move || {
+        let mut reads = 0;
+        while reads < NUM_ITEMS {
+            match rx.try_recv() {
+                Err(_) => continue,
+                Ok(_) => reads += 1,
+            }
+        }
+        reads
+    });
+    let start = std::time::Instant::now();
+    let mut writes = 0;
+    while writes < NUM_ITEMS {
+        match tx.try_send(writes) {
+            Ok(_) => writes += 1,
+            Err(_) => continue,
+        }
+    }
+
+    let r = read_jh.join().expect("Failed to join read join handle");
+    let run_time = start.elapsed();
+    let w = writes;
+    assert_eq!(r, w, "Reads didn't equal writes!");
+
+    let ops_rate = NUM_ITEMS as u128 * 1_000_000_000 / run_time.as_nanos();
+    println!(
+        "Nonblocking MPSC:\t{} ops / second (total time = {:?})",
+        ops_rate, run_time
+    );
+}
+
 fn main() {
     bench_no_cache_version();
     bench_cached_version();
     bench_blocking();
+    bench_mpsc_blocking();
+    bench_mpsc_nonblocking();
 }

@@ -20,7 +20,7 @@ Each time we do an `Acquire` load, we save the value in the cached value slot. W
 ## Blocking Variant
 I added a `Mutex` and `Condvar` to `RingBuffer` to be used for `send_blocking` and `recv_blocking` calls. These methods will block the thread in the event of an empty queue on `pop` or full queue on `push`.
 
-This allows the `Consumer<T>` or `Producer<T>` thread to go to sleep until the condition changes. Let's think throught the possibility for a deadlock: `pop` is called and the queue is empty, `pop` acquires the `Mutex` (the producer thread would have no reason to be holding it), hands it off to the `Condvar` with a call to `wait`, whenever we `push` we call `notify_one` on the `Condvar`. The pattern would be symmetrical from the perspective of the reader: `push` is called and the queue is full, `push` acquires the `Mutex` (the consumer thread would have no reason to be holding it), hands it off to the `Condvar` with a call to `wait`, whenever we `pop` we call `notify_one` on the `Condvar`.
+This allows the `Consumer<T>` or `Producer<T>` thread to go to sleep until the condition changes. Let's think through the possibility for a deadlock: `pop` is called and the queue is empty, `pop` acquires the `Mutex` (the producer thread would have no reason to be holding it), hands it off to the `Condvar` with a call to `wait`, whenever we `push` we call `notify_one` on the `Condvar`. The pattern would be symmetrical from the perspective of the reader: `push` is called and the queue is full, `push` acquires the `Mutex` (the consumer thread would have no reason to be holding it), hands it off to the `Condvar` with a call to `wait`, whenever we `pop` we call `notify_one` on the `Condvar`.
 
 All `Mutex` acquisitions (almost) immediately release, so I don't think it will deadlock.
 
@@ -71,9 +71,13 @@ This still needs deeper exploration with criterion and flamegraph, but prelimina
 
 I'd be curious to analyze lock contention on the blocking version. I believe it should be relatively light as the lock is acquired and almost immediately released in all cases.
 
-* Without Caching Optimization:                 19,504,436 ops / second
-* With Caching Optimization:                    20,068,849 ops / second
-* Blocking Version With Caching Optimization:   19,611,095 ops / second
+I need to dig into the implementation of `std::sync::mpsc` to figure out why that blew me (and Rigtorp) out of the water!
+
+* Without Caching Optimization:                  19,504,436 ops / second
+* With Caching Optimization:                     20,068,849 ops / second
+* Blocking Version With Caching Optimization:    19,611,095 ops / second
+* `std::sync::mpsc::sync_channel()`:             **136,514,974 ops / second**
+* `std::sync::mpsc::sync_channel()` non-blocking **141,972,115 ops / second**
 
 Rigtorp reports benchmarks for his C++ implementation on an AMD Ryzen 9 3900X 12-Core Processor, placing the two threads on different chiplets / core complexes (CCX) to be:
 * Without Caching Optimization: 5,513,850 ops / second
